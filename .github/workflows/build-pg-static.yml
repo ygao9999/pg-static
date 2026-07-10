@@ -60,6 +60,13 @@ jobs:
           "$CC" --version
           find "$NDK_TOOLCHAIN" -maxdepth 3 -iname "sysroot" -type d
 
+      - name: Ensure cmake is available
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake --version || sudo apt-get update -y && sudo apt-get install -y cmake
+          cmake --version
+
       - name: Smoke test cross-compile
         shell: bash
         run: |
@@ -133,6 +140,34 @@ jobs:
           make -j"$(nproc)" SHLIB_LIBS=""
           make install SHLIB_LIBS=""
           ls -la /tmp/staging/lib/libreadline.a /tmp/staging/lib/libhistory.a
+
+      - name: Build static libxml2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          curl -fsSL -o libxml2.tar.xz \
+            "https://download.gnome.org/sources/libxml2/2.14/libxml2-2.14.6.tar.xz"
+          tar xf libxml2.tar.xz
+          cd libxml2-2.14.6
+          NDK_TOOLCHAIN_FILE="/opt/android-ndk/build/cmake/android.toolchain.cmake"
+          test -f "$NDK_TOOLCHAIN_FILE"
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_TOOLCHAIN_FILE" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DCMAKE_INSTALL_PREFIX=/tmp/staging \
+            -DCMAKE_PREFIX_PATH=/tmp/staging \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLIBXML2_WITH_ICONV=OFF \
+            -DLIBXML2_WITH_LZMA=OFF \
+            -DLIBXML2_WITH_PYTHON=OFF \
+            -DLIBXML2_WITH_ZLIB=ON \
+            -DLIBXML2_WITH_TESTS=OFF \
+            -DLIBXML2_WITH_PROGRAMS=OFF
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+          ls -la /tmp/staging/lib/libxml2.a
 
       - name: Upload staging as artifact
         if: always()
