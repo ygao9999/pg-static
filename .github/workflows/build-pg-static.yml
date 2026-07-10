@@ -249,3 +249,126 @@ jobs:
           name: staging-stage1
           path: /tmp/staging
           if-no-files-found: warn
+
+  build-postgres:
+    needs: probe-and-zlib
+    runs-on: ubuntu-24.04
+    env:
+      PG_VERSION: "18.2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache NDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: /opt/android-ndk
+          key: android-ndk-${{ env.NDK_VERSION }}
+
+      - name: Download and unpack NDK (cache miss fallback)
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fsSL -o /tmp/ndk.zip \
+            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          mkdir -p /opt/android-ndk
+          unzip -q /tmp/ndk.zip -d /tmp/ndk-extract
+          mv /tmp/ndk-extract/android-ndk-${NDK_VERSION}/* /opt/android-ndk/
+          rm -rf /tmp/ndk.zip /tmp/ndk-extract
+
+      - name: Set toolchain environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TOOLCHAIN="/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64"
+          echo "NDK_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang" >> "$GITHUB_ENV"
+          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang++" >> "$GITHUB_ENV"
+          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> "$GITHUB_ENV"
+          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
+
+      - name: Download stage1 static deps artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: staging-stage1
+          path: /tmp/staging
+
+      - name: Build host zic (timezone compiler, must run on the build machine)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          curl -fsSL -o postgresql.tar.bz2 \
+            "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2"
+          tar xf postgresql.tar.bz2
+          mkdir -p /tmp/pg-host-build
+          cd /tmp/pg-host-build
+          env -u CC -u CXX -u AR -u RANLIB -u STRIP \
+            CC=gcc CXX=g++ \
+            /tmp/postgresql-${PG_VERSION}/configure --without-readline --without-zlib --without-icu
+          env -u CC -u CXX -u AR -u RANLIB -u STRIP \
+            make -j"$(nproc)" -C src/timezone zic
+          ls -la src/timezone/zic
+          file src/timezone/zic
+
+      - name: Configure and build postgres (cross-compile, partial static link)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp/postgresql-${PG_VERSION}
+
+          STAGING=/tmp/staging
+
+          # Partial static link: pull these libs in statically, everything else
+          # (libc, libm, libdl, liblog, etc. from bionic) stays dynamic.
+          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -lreadline -lhistory -luuid -lz -Wl,-Bdynamic"
+
+          CC="$CC" \
+          CPPFLAGS="-I${STAGING}/include -I${STAGING}/include/libxml2" \
+          LDFLAGS="-L${STAGING}/lib ${STATIC_LIBS}" \
+          ZIC=/tmp/pg-host-build/src/timezone/zic \
+          ./configure \
+            --host=aarch64-linux-android \
+            --prefix=/tmp/pg-install \
+            --with-openssl \
+            --with-libxml \
+            --with-icu \
+            --with-readline \
+            --with-uuid=e2fs \
+            --without-perl \
+            --without-python \
+            --without-tcl \
+            --without-pam \
+            --without-ldap \
+            --without-selinux \
+            --without-systemd
+
+          make -j"$(nproc)" world-bin
+          make install-world-bin DESTDIR=/tmp/pg-install-root
+
+      - name: Inspect resulting binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          find /tmp/pg-install-root -maxdepth 4 -type f | sort
+          file /tmp/pg-install-root/tmp/pg-install/bin/postgres || true
+          file /tmp/pg-install-root/tmp/pg-install/bin/psql || true
+
+      - name: Package result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp/pg-install-root/tmp/pg-install
+          tar czf /tmp/postgresql-${PG_VERSION}-android-aarch64.tar.gz .
+
+      - name: Upload postgres build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgresql-android-aarch64
+          path: /tmp/postgresql-${{ env.PG_VERSION }}-android-aarch64.tar.gz
+          if-no-files-found: warn
