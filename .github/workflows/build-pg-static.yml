@@ -171,6 +171,28 @@ jobs:
           cmake --install build
           ls -la /tmp/staging/lib/libxml2.a
 
+      - name: Build static openssl
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          curl -fsSL -o openssl.tar.gz \
+            "https://github.com/openssl/openssl/releases/download/openssl-3.0.21/openssl-3.0.21.tar.gz"
+          tar xf openssl.tar.gz
+          cd openssl-3.0.21
+          export ANDROID_NDK_ROOT=/opt/android-ndk
+          export PATH="$NDK_TOOLCHAIN/bin:$PATH"
+          ./Configure android-arm64 \
+            -D__ANDROID_API__=${ANDROID_API} \
+            no-shared \
+            no-tests \
+            no-engine \
+            --prefix=/tmp/staging \
+            --openssldir=/tmp/staging/ssl
+          make -j"$(nproc)"
+          make install_sw
+          ls -la /tmp/staging/lib/libssl.a /tmp/staging/lib/libcrypto.a
+
       - name: Upload staging as artifact
         if: always()
         uses: actions/upload-artifact@v4
