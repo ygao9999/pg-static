@@ -95,7 +95,6 @@ jobs:
               --host=aarch64-linux-android \
               --prefix=/tmp/staging \
               --enable-libuuid \
-              --disable-libblkid \
               --disable-shared \
               --enable-static \
               --disable-defrag \
