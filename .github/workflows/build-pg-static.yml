@@ -1,4 +1,4 @@
-name: "Build static postgres deps - stage 1 probe and zlib"
+name: "Build static postgres deps - merged pipeline"
 
 on:
   workflow_dispatch:
@@ -20,13 +20,18 @@ env:
   ANDROID_API: 24
   NDK_VERSION: r27c
   DEPS_RELEASE_TAG: deps-baseline-v1
+  PG_VERSION: "18.2"
 
 jobs:
-  check-deps-release:
+  build-all:
     runs-on: ubuntu-24.04
-    outputs:
-      deps_exist: ${{ steps.check.outputs.exists }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Step 1: Decide whether we need to rebuild the 6 static deps.
+      # ------------------------------------------------------------------
       - name: Check whether deps release already has the staging asset
         id: check
         shell: bash
@@ -34,7 +39,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
-          FORCE="${{ inputs.force_rebuild_deps }}"
+          FORCE="${{ inputs.force_rebuild_deps || 'false' }}"
           if [ "$FORCE" = "true" ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -46,20 +51,15 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-  probe-and-zlib:
-    needs: check-deps-release
-    if: needs.check-deps-release.outputs.deps_exist != 'true'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      # ------------------------------------------------------------------
+      # Step 2: NDK setup (shared by deps build and postgres build).
+      # ------------------------------------------------------------------
       - name: Cache NDK
         id: cache-ndk
         uses: actions/cache@v4
         with:
           path: /opt/android-ndk
-          key: android-ndk-${{ env.NDK_VERSION }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux
 
       - name: Download and unpack NDK
         if: steps.cache-ndk.outputs.cache-hit != 'true'
@@ -99,7 +99,10 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          cmake --version || sudo apt-get update -y && sudo apt-get install -y cmake
+          if ! cmake --version >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y cmake
+          fi
           cmake --version
 
       - name: Smoke test cross-compile
@@ -114,7 +117,49 @@ jobs:
           "$CC" /tmp/smoke/hello.c -o /tmp/smoke/hello
           file /tmp/smoke/hello
 
+      # ------------------------------------------------------------------
+      # Step 3a: If deps already exist in Release, download them with retries.
+      #          This branch is the only path when steps.check.outputs.exists == 'true'.
+      # ------------------------------------------------------------------
+      - name: Download staging deps from Release (with retries + integrity check)
+        if: steps.check.outputs.exists == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/staging
+          for attempt in 1 2 3 4 5 6 7 8; do
+            echo "::group::Release download attempt $attempt"
+            rm -f /tmp/staging-stage1.tar.gz
+            if gh release download "$DEPS_RELEASE_TAG" \
+                 --repo "${{ github.repository }}" \
+                 --pattern "staging-stage1.tar.gz" \
+                 --dir /tmp --clobber 2>/dev/null; then
+              if [ -f /tmp/staging-stage1.tar.gz ] \
+                 && gzip -t /tmp/staging-stage1.tar.gz 2>/dev/null; then
+                echo "Tarball passed gzip integrity check."
+                tar xzf /tmp/staging-stage1.tar.gz -C /tmp/staging
+                echo "::endgroup::"
+                exit 0
+              else
+                echo "Downloaded asset failed gzip integrity check, retrying..."
+              fi
+            else
+              echo "gh release download failed on attempt $attempt"
+            fi
+            echo "::endgroup::"
+            sleep $((attempt * 5))
+          done
+          echo "::error::Failed to download staging-stage1.tar.gz after 8 attempts"
+          exit 1
+
+      # ------------------------------------------------------------------
+      # Step 3b: Build all 6 static deps from source (only when Release
+      #          asset is missing or force_rebuild_deps is true).
+      # ------------------------------------------------------------------
       - name: Build static zlib
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -131,6 +176,7 @@ jobs:
           ls -la /tmp/staging/lib/libz.a
 
       - name: Build static libuuid (e2fsprogs)
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -155,6 +201,7 @@ jobs:
           ls -la /tmp/staging/lib/libuuid.a
 
       - name: Build static readline
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -179,6 +226,7 @@ jobs:
           ls -la /tmp/staging/lib/libreadline.a /tmp/staging/lib/libhistory.a
 
       - name: Build static libxml2
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -207,6 +255,7 @@ jobs:
           ls -la /tmp/staging/lib/libxml2.a
 
       - name: Build static openssl
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -229,6 +278,7 @@ jobs:
           ls -la /tmp/staging/lib/libssl.a /tmp/staging/lib/libcrypto.a
 
       - name: Build host ICU (needed as build tool for cross-compile)
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -239,10 +289,10 @@ jobs:
           tar xf icu-src.tgz -C icu-host
           cd icu-host/icu/source
           # IMPORTANT: unset the Android cross-compiler env vars inherited from
-          # GITHUB_ENV (set in the "Set toolchain environment" step). This host
-          # build must use the runner's native x86_64 gcc/g++, not the aarch64
-          # Android clang, otherwise configure mis-detects the build system as
-          # x86_64-pc-linux-android and produces non-runnable host tools.
+          # GITHUB_ENV. This host build must use the runner's native x86_64
+          # gcc/g++, not the aarch64 Android clang, otherwise configure
+          # mis-detects the build system as x86_64-pc-linux-android and
+          # produces non-runnable host tools.
           env -u CC -u CXX -u AR -u RANLIB -u STRIP \
             CC=gcc CXX=g++ AR=ar RANLIB=ranlib \
             ./configure --prefix=/tmp/icu-host-install --disable-tests --disable-samples
@@ -253,6 +303,7 @@ jobs:
           ls -la /tmp/icu-host-install/bin | head -20
 
       - name: Build static ICU for aarch64-android (cross-compile using host tools)
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
@@ -277,15 +328,12 @@ jobs:
           make install
           ls -la /tmp/staging/lib/libicuuc.a /tmp/staging/lib/libicui18n.a /tmp/staging/lib/libicudata.a
 
-      - name: Upload staging as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: staging-stage1
-          path: /tmp/staging
-          if-no-files-found: warn
-
-      - name: Publish staging as a permanent GitHub Release asset
+      # ------------------------------------------------------------------
+      # Step 4: Publish deps to Release (only when we just built them).
+      #         Includes a post-upload visibility poll.
+      # ------------------------------------------------------------------
+      - name: Package and publish staging to Release
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -293,6 +341,7 @@ jobs:
           set -euxo pipefail
           cd /tmp
           tar czf staging-stage1.tar.gz -C /tmp/staging .
+          ls -la staging-stage1.tar.gz
           if gh release view "$DEPS_RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release upload "$DEPS_RELEASE_TAG" /tmp/staging-stage1.tar.gz \
               --repo "${{ github.repository }}" --clobber
@@ -303,73 +352,71 @@ jobs:
               --notes "Auto-published by build-pg-static.yml. Contains staging-stage1.tar.gz with the 6 statically-built libs for aarch64-android (API ${{ env.ANDROID_API }})."
           fi
 
-  build-postgres:
-    needs: [check-deps-release, probe-and-zlib]
-    if: always() && (needs.probe-and-zlib.result == 'success' || needs.check-deps-release.outputs.deps_exist == 'true')
-    runs-on: ubuntu-24.04
-    env:
-      PG_VERSION: "18.2"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Cache NDK
-        id: cache-ndk
-        uses: actions/cache@v4
-        with:
-          path: /opt/android-ndk
-          key: android-ndk-${{ env.NDK_VERSION }}
-
-      - name: Download and unpack NDK (cache miss fallback)
-        if: steps.cache-ndk.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -euxo pipefail
-          curl -fsSL -o /tmp/ndk.zip \
-            "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
-          mkdir -p /opt/android-ndk
-          unzip -q /tmp/ndk.zip -d /tmp/ndk-extract
-          mv /tmp/ndk-extract/android-ndk-${NDK_VERSION}/* /opt/android-ndk/
-          rm -rf /tmp/ndk.zip /tmp/ndk-extract
-
-      - name: Set toolchain environment
-        shell: bash
-        run: |
-          set -euxo pipefail
-          TOOLCHAIN="/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64"
-          echo "NDK_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
-          echo "CC=$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang" >> "$GITHUB_ENV"
-          echo "CXX=$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang++" >> "$GITHUB_ENV"
-          echo "AR=$TOOLCHAIN/bin/llvm-ar" >> "$GITHUB_ENV"
-          echo "RANLIB=$TOOLCHAIN/bin/llvm-ranlib" >> "$GITHUB_ENV"
-          echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> "$GITHUB_ENV"
-          echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
-
-      - name: Download staging deps (prefer permanent Release asset)
+      - name: Verify Release asset published (poll for visibility)
+        if: steps.check.outputs.exists != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euxo pipefail
-          mkdir -p /tmp/staging
-          if gh release download "$DEPS_RELEASE_TAG" \
-               --repo "${{ github.repository }}" \
-               --pattern "staging-stage1.tar.gz" \
-               --dir /tmp --clobber 2>/dev/null; then
-            echo "Downloaded staging-stage1.tar.gz from Release $DEPS_RELEASE_TAG"
-            tar xzf /tmp/staging-stage1.tar.gz -C /tmp/staging
-          else
-            echo "No Release asset found, this run must have just built deps fresh; artifact download below will cover it."
-          fi
+          set -euo pipefail
+          # gh release upload is eventually-consistent on the assets list —
+          # poll a few times before trusting it.
+          for i in 1 2 3 4 5 6; do
+            if gh release view "$DEPS_RELEASE_TAG" --repo "${{ github.repository }}" \
+                 --json assets --jq '.assets[].name' | grep -q "staging-stage1.tar.gz"; then
+              echo "Asset visible in Release."
+              exit 0
+            fi
+            echo "Asset not yet visible (attempt $i), waiting 10s..."
+            sleep 10
+          done
+          echo "::error::staging-stage1.tar.gz not visible in Release after 60s"
+          exit 1
 
-      - name: Download stage1 static deps artifact (fallback if Release asset missing)
-        if: needs.check-deps-release.outputs.deps_exist != 'true'
-        uses: actions/download-artifact@v4
+      # ------------------------------------------------------------------
+      # Step 5: Verify staging dir has all required static libs before
+      #         proceeding to postgres build. Fail fast if anything's missing.
+      # ------------------------------------------------------------------
+      - name: Verify staging contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Staging lib dir"
+          ls -la /tmp/staging/lib/ | head -40
+          echo "::endgroup::"
+          missing=0
+          for lib in libz.a libuuid.a libreadline.a libhistory.a libxml2.a \
+                     libssl.a libcrypto.a libicuuc.a libicui18n.a libicudata.a; do
+            if [ ! -f "/tmp/staging/lib/$lib" ]; then
+              echo "::error::Missing required static lib: $lib"
+              missing=1
+            fi
+          done
+          if [ "$missing" != "0" ]; then
+            echo "::error::One or more required static libs are missing — aborting before postgres build."
+            exit 1
+          fi
+          echo "All required static libs present."
+
+      # ------------------------------------------------------------------
+      # Step 6: Upload staging as a workflow artifact too (for debugging
+      #         and as a secondary fallback). `if: always()` so we get it
+      #         even if a later step fails.
+      # ------------------------------------------------------------------
+      - name: Upload staging as workflow artifact
+        if: always() && steps.check.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: staging-stage1
           path: /tmp/staging
+          if-no-files-found: warn
+          retention-days: 14
 
-      - name: Build host zic (timezone compiler, must run on the build machine)
+      # ------------------------------------------------------------------
+      # Step 7: Build host zic (timezone compiler, must run on the build
+      #         machine). zic is needed by postgres's configure/make.
+      # ------------------------------------------------------------------
+      - name: Download postgresql source
         shell: bash
         run: |
           set -euxo pipefail
@@ -377,6 +424,12 @@ jobs:
           curl -fsSL -o postgresql.tar.bz2 \
             "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2"
           tar xf postgresql.tar.bz2
+          ls -d /tmp/postgresql-${PG_VERSION}
+
+      - name: Build host zic (timezone compiler)
+        shell: bash
+        run: |
+          set -euxo pipefail
           mkdir -p /tmp/pg-host-build
           cd /tmp/pg-host-build
           env -u CC -u CXX -u AR -u RANLIB -u STRIP \
@@ -387,6 +440,9 @@ jobs:
           ls -la src/timezone/zic
           file src/timezone/zic
 
+      # ------------------------------------------------------------------
+      # Step 8: Cross-compile postgres itself, partial-static-link style.
+      # ------------------------------------------------------------------
       - name: Configure and build postgres (cross-compile, partial static link)
         shell: bash
         run: |
@@ -435,6 +491,9 @@ jobs:
           make -j"$(nproc)" world-bin
           make install-world-bin DESTDIR=/tmp/pg-install-root
 
+      # ------------------------------------------------------------------
+      # Step 9: Inspect + package + upload the final postgres binaries.
+      # ------------------------------------------------------------------
       - name: Inspect resulting binaries
         shell: bash
         run: |
@@ -449,6 +508,7 @@ jobs:
           set -euxo pipefail
           cd /tmp/pg-install-root/tmp/pg-install
           tar czf /tmp/postgresql-${PG_VERSION}-android-aarch64.tar.gz .
+          ls -la /tmp/postgresql-${PG_VERSION}-android-aarch64.tar.gz
 
       - name: Upload postgres build artifact
         if: always()
@@ -457,3 +517,4 @@ jobs:
           name: postgresql-android-aarch64
           path: /tmp/postgresql-${{ env.PG_VERSION }}-android-aarch64.tar.gz
           if-no-files-found: warn
+          retention-days: 30
