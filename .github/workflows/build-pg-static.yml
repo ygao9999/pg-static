@@ -203,9 +203,18 @@ jobs:
           mkdir -p icu-host
           tar xf icu-src.tgz -C icu-host
           cd icu-host/icu/source
-          ./configure --prefix=/tmp/icu-host-install --disable-tests --disable-samples
-          make -j"$(nproc)"
-          make install
+          # IMPORTANT: unset the Android cross-compiler env vars inherited from
+          # GITHUB_ENV (set in the "Set toolchain environment" step). This host
+          # build must use the runner's native x86_64 gcc/g++, not the aarch64
+          # Android clang, otherwise configure mis-detects the build system as
+          # x86_64-pc-linux-android and produces non-runnable host tools.
+          env -u CC -u CXX -u AR -u RANLIB -u STRIP \
+            CC=gcc CXX=g++ AR=ar RANLIB=ranlib \
+            ./configure --prefix=/tmp/icu-host-install --disable-tests --disable-samples
+          env -u CC -u CXX -u AR -u RANLIB -u STRIP \
+            make -j"$(nproc)"
+          env -u CC -u CXX -u AR -u RANLIB -u STRIP \
+            make install
           ls -la /tmp/icu-host-install/bin | head -20
 
       - name: Build static ICU for aarch64-android (cross-compile using host tools)
