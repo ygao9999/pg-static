@@ -325,11 +325,24 @@ jobs:
 
           # Partial static link: pull these libs in statically, everything else
           # (libc, libm, libdl, liblog, etc. from bionic) stays dynamic.
+          #
+          # IMPORTANT: this must go into LIBS, not LDFLAGS. configure's
+          # AC_CHECK_LIB probes link a tiny conftest.c as roughly:
+          #   $CC $CFLAGS $LDFLAGS -o conftest conftest.c -lreadline $LIBS
+          # If the -Wl,-Bstatic/-Bdynamic wrapping lives in LDFLAGS, it ends up
+          # positioned *before* the -lreadline that autoconf appends on the
+          # command line itself, so the static/dynamic switch has already been
+          # reset back to dynamic (autoconf's own -lreadline isn't wrapped) by
+          # the time the linker reaches it, and the static .a in our staging
+          # dir is never found by the search. Putting the whole wrapped list in
+          # LIBS instead means it's appended *after* configure's own -lreadline,
+          # so our static copy resolves the symbols first.
           STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -lreadline -lhistory -luuid -lz -Wl,-Bdynamic"
 
           CC="$CC" \
           CPPFLAGS="-I${STAGING}/include -I${STAGING}/include/libxml2" \
-          LDFLAGS="-L${STAGING}/lib ${STATIC_LIBS}" \
+          LDFLAGS="-L${STAGING}/lib" \
+          LIBS="${STATIC_LIBS}" \
           ZIC=/tmp/pg-host-build/src/timezone/zic \
           ./configure \
             --host=aarch64-linux-android \
