@@ -1,4 +1,4 @@
-name: Build static postgres deps (stage 1: probe + zlib)
+name: "Build static postgres deps - stage 1 probe and zlib"
 
 on:
   workflow_dispatch: {}
@@ -27,10 +27,20 @@ jobs:
           find / -maxdepth 8 -iname "sysroot" -type d 2>/dev/null | head -20
           echo "== find NDK root =="
           find / -maxdepth 6 -iname "*ndk*" -type d 2>/dev/null | head -20
-          echo "== termux-packages repo location (if present in image) =="
+          echo "== termux-packages repo location in image =="
           find / -maxdepth 4 -iname "termux-packages" -type d 2>/dev/null
-          echo "== cat build/build_package.sh env helpers if present =="
+          echo "== toolchain setup helper scripts =="
           find / -maxdepth 6 -iname "termux_step_setup_toolchain*" 2>/dev/null
+
+      - name: Write smoke test source
+        shell: bash
+        run: |
+          mkdir -p /tmp/smoke
+          printf '%s\n' \
+            '#include <stdio.h>' \
+            'int main(void) { printf("hello from static-ish android build\n"); return 0; }' \
+            > /tmp/smoke/hello.c
+          cat /tmp/smoke/hello.c
 
       - name: Try a minimal clang cross-compile smoke test
         shell: bash
@@ -42,15 +52,13 @@ jobs:
           fi
           echo "Using CLANG_BIN=$CLANG_BIN"
           if [ -z "$CLANG_BIN" ]; then
-            echo "!!! No aarch64-linux-android clang found in image. Dumping PATH dirs for manual inspection."
-            for d in $(echo $PATH | tr ':' ' '); do echo "-- $d --"; ls "$d" 2>/dev/null | grep -i clang; done
+            echo "No aarch64-linux-android clang found in image. Dumping PATH dirs for manual inspection."
+            for d in $(echo "$PATH" | tr ':' ' '); do
+              echo "-- $d --"
+              ls "$d" 2>/dev/null | grep -i clang || true
+            done
             exit 1
           fi
-          mkdir -p /tmp/smoke
-          cat > /tmp/smoke/hello.c << 'EOF'
-          #include <stdio.h>
-          int main() { printf("hello from static-ish android build\n"); return 0; }
-          EOF
           "$CLANG_BIN" /tmp/smoke/hello.c -o /tmp/smoke/hello
           file /tmp/smoke/hello || true
           echo "CLANG_BIN_RESOLVED=$CLANG_BIN" >> "$GITHUB_ENV"
