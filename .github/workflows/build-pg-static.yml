@@ -261,7 +261,6 @@ jobs:
       # separately before probing for readline.
       # ------------------------------------------------------------------
       - name: Build minimal termcap stub library
-        if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
