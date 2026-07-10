@@ -81,6 +81,31 @@ jobs:
           make install
           ls -la /tmp/staging/lib/libz.a
 
+      - name: Build static libuuid (e2fsprogs)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          curl -fsSL -o e2fsprogs.tar.gz \
+            "https://sourceforge.net/projects/e2fsprogs/files/e2fsprogs/v1.47.4/e2fsprogs-1.47.4.tar.gz/download"
+          tar xf e2fsprogs.tar.gz
+          cd e2fsprogs-1.47.4
+          CC="$CC" AR="$AR" RANLIB="$RANLIB" \
+            ./configure \
+              --host=aarch64-linux-android \
+              --prefix=/tmp/staging \
+              --enable-libuuid \
+              --disable-libblkid \
+              --disable-shared \
+              --enable-static \
+              --disable-defrag \
+              --disable-e2initrd-helper \
+              --disable-fsck \
+              --disable-uuidd
+          make -C lib/uuid -j"$(nproc)"
+          make -C lib/uuid install
+          ls -la /tmp/staging/lib/libuuid.a
+
       - name: Upload staging as artifact
         if: always()
         uses: actions/upload-artifact@v4
