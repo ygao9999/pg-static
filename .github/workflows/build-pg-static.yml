@@ -1,0 +1,64 @@
+name: Build static postgres deps (stage 1: probe + zlib)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe-and-zlib:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/termux/package-builder:latest
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Probe toolchain environment
+        shell: bash
+        run: |
+          set -x
+          echo "== whoami / pwd =="
+          whoami; pwd
+          echo "== env dump (filtered) =="
+          env | grep -Ei 'termux|ndk|android|clang|prefix|sysroot' | sort || true
+          echo "== find clang binaries =="
+          find / -maxdepth 8 -iname "*android*clang*" 2>/dev/null | head -50
+          echo "== find sysroot dirs =="
+          find / -maxdepth 8 -iname "sysroot" -type d 2>/dev/null | head -20
+          echo "== find NDK root =="
+          find / -maxdepth 6 -iname "*ndk*" -type d 2>/dev/null | head -20
+          echo "== termux-packages repo location (if present in image) =="
+          find / -maxdepth 4 -iname "termux-packages" -type d 2>/dev/null
+          echo "== cat build/build_package.sh env helpers if present =="
+          find / -maxdepth 6 -iname "termux_step_setup_toolchain*" 2>/dev/null
+
+      - name: Try a minimal clang cross-compile smoke test
+        shell: bash
+        run: |
+          set -x
+          CLANG_BIN=$(find / -maxdepth 8 -iname "aarch64-linux-android21-clang" 2>/dev/null | head -1)
+          if [ -z "$CLANG_BIN" ]; then
+            CLANG_BIN=$(find / -maxdepth 8 -iname "aarch64-linux-android*-clang" 2>/dev/null | head -1)
+          fi
+          echo "Using CLANG_BIN=$CLANG_BIN"
+          if [ -z "$CLANG_BIN" ]; then
+            echo "!!! No aarch64-linux-android clang found in image. Dumping PATH dirs for manual inspection."
+            for d in $(echo $PATH | tr ':' ' '); do echo "-- $d --"; ls "$d" 2>/dev/null | grep -i clang; done
+            exit 1
+          fi
+          mkdir -p /tmp/smoke
+          cat > /tmp/smoke/hello.c << 'EOF'
+          #include <stdio.h>
+          int main() { printf("hello from static-ish android build\n"); return 0; }
+          EOF
+          "$CLANG_BIN" /tmp/smoke/hello.c -o /tmp/smoke/hello
+          file /tmp/smoke/hello || true
+          echo "CLANG_BIN_RESOLVED=$CLANG_BIN" >> "$GITHUB_ENV"
+
+      - name: Upload probe log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-log
+          path: /tmp/smoke
+          if-no-files-found: ignore
