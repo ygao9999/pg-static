@@ -110,6 +110,30 @@ jobs:
           make -C lib/uuid install
           ls -la /tmp/staging/lib/libuuid.a
 
+      - name: Build static readline
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          curl -fsSL -o readline.tar.gz https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz
+          tar xf readline.tar.gz
+          cd readline-8.3
+          CC="$CC" AR="$AR" RANLIB="$RANLIB" \
+            bash_cv_termcap_lib=none \
+            bash_cv_signed_chars=yes \
+            bash_cv_must_reinstall_sighandlers=no \
+            bash_cv_wcwidth_broken=no \
+            ./configure \
+              --host=aarch64-linux-android \
+              --prefix=/tmp/staging \
+              --disable-shared \
+              --enable-static \
+              --with-curses=no \
+              --without-purify
+          make -j"$(nproc)" SHLIB_LIBS=""
+          make install SHLIB_LIBS=""
+          ls -la /tmp/staging/lib/libreadline.a /tmp/staging/lib/libhistory.a
+
       - name: Upload staging as artifact
         if: always()
         uses: actions/upload-artifact@v4
