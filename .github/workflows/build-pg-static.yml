@@ -193,6 +193,46 @@ jobs:
           make install_sw
           ls -la /tmp/staging/lib/libssl.a /tmp/staging/lib/libcrypto.a
 
+      - name: Build host ICU (needed as build tool for cross-compile)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          curl -fsSL -o icu-src.tgz \
+            "https://github.com/unicode-org/icu/releases/download/release-78-3/icu4c-78_3-src.tgz"
+          mkdir -p icu-host
+          tar xf icu-src.tgz -C icu-host
+          cd icu-host/icu/source
+          ./configure --prefix=/tmp/icu-host-install --disable-tests --disable-samples
+          make -j"$(nproc)"
+          make install
+          ls -la /tmp/icu-host-install/bin | head -20
+
+      - name: Build static ICU for aarch64-android (cross-compile using host tools)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          mkdir -p icu-target
+          tar xf icu-src.tgz -C icu-target
+          cd icu-target/icu/source
+          CC="$CC" CXX="$CXX" AR="$AR" RANLIB="$RANLIB" \
+            CXXFLAGS="-std=c++17" \
+            ./configure \
+              --host=aarch64-linux-android \
+              --with-cross-build=/tmp/icu-host/icu/source \
+              --prefix=/tmp/staging \
+              --enable-static \
+              --disable-shared \
+              --disable-tests \
+              --disable-samples \
+              --disable-extras \
+              --disable-tools \
+              --with-data-packaging=static
+          make -j"$(nproc)"
+          make install
+          ls -la /tmp/staging/lib/libicuuc.a /tmp/staging/lib/libicui18n.a /tmp/staging/lib/libicudata.a
+
       - name: Upload staging as artifact
         if: always()
         uses: actions/upload-artifact@v4
