@@ -1,19 +1,54 @@
 name: "Build static postgres deps - stage 1 probe and zlib"
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_rebuild_deps:
+        description: "Force rebuilding the 6 static deps even if a deps release already exists"
+        type: boolean
+        default: false
   push:
     branches:
       - main
     paths:
       - '.github/workflows/build-pg-static.yml'
 
+permissions:
+  contents: write
+
 env:
   ANDROID_API: 24
   NDK_VERSION: r27c
+  DEPS_RELEASE_TAG: deps-baseline-v1
 
 jobs:
+  check-deps-release:
+    runs-on: ubuntu-24.04
+    outputs:
+      deps_exist: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Check whether deps release already has the staging asset
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          FORCE="${{ inputs.force_rebuild_deps }}"
+          if [ "$FORCE" = "true" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh release view "$DEPS_RELEASE_TAG" --repo "${{ github.repository }}" \
+               --json assets --jq '.assets[].name' 2>/dev/null | grep -q "staging-stage1.tar.gz"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
   probe-and-zlib:
+    needs: check-deps-release
+    if: needs.check-deps-release.outputs.deps_exist != 'true'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -250,8 +285,27 @@ jobs:
           path: /tmp/staging
           if-no-files-found: warn
 
+      - name: Publish staging as a permanent GitHub Release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          cd /tmp
+          tar czf staging-stage1.tar.gz -C /tmp/staging .
+          if gh release view "$DEPS_RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$DEPS_RELEASE_TAG" /tmp/staging-stage1.tar.gz \
+              --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$DEPS_RELEASE_TAG" /tmp/staging-stage1.tar.gz \
+              --repo "${{ github.repository }}" \
+              --title "Static deps baseline (zlib/uuid/readline/libxml2/openssl/icu)" \
+              --notes "Auto-published by build-pg-static.yml. Contains staging-stage1.tar.gz with the 6 statically-built libs for aarch64-android (API ${{ env.ANDROID_API }})."
+          fi
+
   build-postgres:
-    needs: probe-and-zlib
+    needs: [check-deps-release, probe-and-zlib]
+    if: always() && (needs.probe-and-zlib.result == 'success' || needs.check-deps-release.outputs.deps_exist == 'true')
     runs-on: ubuntu-24.04
     env:
       PG_VERSION: "18.2"
@@ -291,7 +345,25 @@ jobs:
           echo "STRIP=$TOOLCHAIN/bin/llvm-strip" >> "$GITHUB_ENV"
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-      - name: Download stage1 static deps artifact
+      - name: Download staging deps (prefer permanent Release asset)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/staging
+          if gh release download "$DEPS_RELEASE_TAG" \
+               --repo "${{ github.repository }}" \
+               --pattern "staging-stage1.tar.gz" \
+               --dir /tmp --clobber 2>/dev/null; then
+            echo "Downloaded staging-stage1.tar.gz from Release $DEPS_RELEASE_TAG"
+            tar xzf /tmp/staging-stage1.tar.gz -C /tmp/staging
+          else
+            echo "No Release asset found, this run must have just built deps fresh; artifact download below will cover it."
+          fi
+
+      - name: Download stage1 static deps artifact (fallback if Release asset missing)
+        if: needs.check-deps-release.outputs.deps_exist != 'true'
         uses: actions/download-artifact@v4
         with:
           name: staging-stage1
