@@ -119,7 +119,6 @@ jobs:
 
       # ------------------------------------------------------------------
       # Step 3a: If deps already exist in Release, download them with retries.
-      #          This branch is the only path when steps.check.outputs.exists == 'true'.
       # ------------------------------------------------------------------
       - name: Download staging deps from Release (with retries + integrity check)
         if: steps.check.outputs.exists == 'true'
@@ -155,8 +154,7 @@ jobs:
           exit 1
 
       # ------------------------------------------------------------------
-      # Step 3b: Build all 6 static deps from source (only when Release
-      #          asset is missing or force_rebuild_deps is true).
+      # Step 3b: Build all 6 static deps from source.
       # ------------------------------------------------------------------
       - name: Build static zlib
         if: steps.check.outputs.exists != 'true'
@@ -225,6 +223,75 @@ jobs:
           make install SHLIB_LIBS=""
           ls -la /tmp/staging/lib/libreadline.a /tmp/staging/lib/libhistory.a
 
+      # ------------------------------------------------------------------
+      # NEW: Verify libreadline.a actually contains the symbols postgres
+      # will look for. Fail fast if the build silently produced an empty
+      # or partial archive.
+      # ------------------------------------------------------------------
+      - name: Verify readline static lib symbols
+        if: steps.check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          NM="$NDK_TOOLCHAIN/bin/llvm-nm"
+          echo "===== libreadline.a symbols (T = text/defined) ====="
+          "$NM" /tmp/staging/lib/libreadline.a | grep -E "^[0-9a-f]+ T " | head -40
+          echo "===== checking required symbols ====="
+          for sym in readline rl_completion_matches rl_filename_completion_function; do
+            if "$NM" /tmp/staging/lib/libreadline.a 2>/dev/null | grep -qE " T ${sym}$"; then
+              echo "OK: $sym found in libreadline.a"
+            else
+              echo "::error::Missing symbol in libreadline.a: $sym"
+              # Also check undefined symbols (U) to see what readline wants
+              echo "----- undefined symbols (U) referenced by libreadline.a -----"
+              "$NM" /tmp/staging/lib/libreadline.a 2>/dev/null | grep -E " U " | sort -u | head -60
+              exit 1
+            fi
+          done
+
+      # ------------------------------------------------------------------
+      # NEW: Build a minimal libtermcap.a stub. Even though readline was
+      # configured with bash_cv_termcap_lib=none, in practice libreadline.a
+      # on Android still ends up with unresolved references to tgetent /
+      # tputs / tgoto etc. (readline's own termcap.c stub isn't always
+      # compiled in). This tiny stub resolves them with no-op returns.
+          #
+      # This stub is also what postgres's AC_SEARCH_LIBS([tgetent],
+      # [termcap ...]) will find as "-ltermcap" if it probes for termcap
+      # separately before probing for readline.
+      # ------------------------------------------------------------------
+      - name: Build minimal termcap stub library
+        if: steps.check.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/termcap-stub
+          cat > /tmp/termcap-stub/termcap.c <<'STUB_EOF'
+          /* Minimal termcap stub for Android cross-compile.
+           * Provides dummy implementations of termcap functions that
+           * libreadline.a may reference at link time. With
+           * bash_cv_termcap_lib=none, readline uses its own terminal
+           * handling at runtime, so these are never actually called —
+           * they just need to exist for static link resolution.
+           */
+          int tgetent(char *buf, const char *name) { (void)buf; (void)name; return 1; }
+          int tgetflag(const char *id) { (void)id; return 0; }
+          int tgetnum(const char *id) { (void)id; return -1; }
+          char *tgetstr(const char *id, char **area) { (void)id; (void)area; return (char *)0; }
+          int tputs(const char *cp, int affcnt, int (*outc)(int)) {
+            (void)cp; (void)affcnt; (void)outc; return 0;
+          }
+          char *tgoto(const char *cm, int col, int row) {
+            (void)col; (void)row; return (char *)cm;
+          }
+          STUB_EOF
+          $CC -c /tmp/termcap-stub/termcap.c -o /tmp/termcap-stub/termcap.o
+          $AR rcs /tmp/staging/lib/libtermcap.a /tmp/termcap-stub/termcap.o
+          $RANLIB /tmp/staging/lib/libtermcap.a
+          ls -la /tmp/staging/lib/libtermcap.a
+          echo "===== libtermcap.a symbols ====="
+          "$NDK_TOOLCHAIN/bin/llvm-nm" /tmp/staging/lib/libtermcap.a
+
       - name: Build static libxml2
         if: steps.check.outputs.exists != 'true'
         shell: bash
@@ -288,11 +355,6 @@ jobs:
           mkdir -p icu-host
           tar xf icu-src.tgz -C icu-host
           cd icu-host/icu/source
-          # IMPORTANT: unset the Android cross-compiler env vars inherited from
-          # GITHUB_ENV. This host build must use the runner's native x86_64
-          # gcc/g++, not the aarch64 Android clang, otherwise configure
-          # mis-detects the build system as x86_64-pc-linux-android and
-          # produces non-runnable host tools.
           env -u CC -u CXX -u AR -u RANLIB -u STRIP \
             CC=gcc CXX=g++ AR=ar RANLIB=ranlib \
             ./configure --prefix=/tmp/icu-host-install --disable-tests --disable-samples
@@ -330,7 +392,6 @@ jobs:
 
       # ------------------------------------------------------------------
       # Step 4: Publish deps to Release (only when we just built them).
-      #         Includes a post-upload visibility poll.
       # ------------------------------------------------------------------
       - name: Package and publish staging to Release
         if: steps.check.outputs.exists != 'true'
@@ -348,8 +409,8 @@ jobs:
           else
             gh release create "$DEPS_RELEASE_TAG" /tmp/staging-stage1.tar.gz \
               --repo "${{ github.repository }}" \
-              --title "Static deps baseline (zlib/uuid/readline/libxml2/openssl/icu)" \
-              --notes "Auto-published by build-pg-static.yml. Contains staging-stage1.tar.gz with the 6 statically-built libs for aarch64-android (API ${{ env.ANDROID_API }})."
+              --title "Static deps baseline (zlib/uuid/readline/libxml2/openssl/icu/termcap-stub)" \
+              --notes "Auto-published by build-pg-static.yml. Contains staging-stage1.tar.gz with statically-built libs for aarch64-android (API ${{ env.ANDROID_API }})."
           fi
 
       - name: Verify Release asset published (poll for visibility)
@@ -359,8 +420,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # gh release upload is eventually-consistent on the assets list —
-          # poll a few times before trusting it.
           for i in 1 2 3 4 5 6; do
             if gh release view "$DEPS_RELEASE_TAG" --repo "${{ github.repository }}" \
                  --json assets --jq '.assets[].name' | grep -q "staging-stage1.tar.gz"; then
@@ -374,8 +433,7 @@ jobs:
           exit 1
 
       # ------------------------------------------------------------------
-      # Step 5: Verify staging dir has all required static libs before
-      #         proceeding to postgres build. Fail fast if anything's missing.
+      # Step 5: Verify staging dir has all required static libs.
       # ------------------------------------------------------------------
       - name: Verify staging contents
         shell: bash
@@ -386,7 +444,8 @@ jobs:
           echo "::endgroup::"
           missing=0
           for lib in libz.a libuuid.a libreadline.a libhistory.a libxml2.a \
-                     libssl.a libcrypto.a libicuuc.a libicui18n.a libicudata.a; do
+                     libssl.a libcrypto.a libicuuc.a libicui18n.a libicudata.a \
+                     libtermcap.a; do
             if [ ! -f "/tmp/staging/lib/$lib" ]; then
               echo "::error::Missing required static lib: $lib"
               missing=1
@@ -396,12 +455,10 @@ jobs:
             echo "::error::One or more required static libs are missing — aborting before postgres build."
             exit 1
           fi
-          echo "All required static libs present."
+          echo "All required static libs present (including libtermcap.a stub)."
 
       # ------------------------------------------------------------------
-      # Step 6: Upload staging as a workflow artifact too (for debugging
-      #         and as a secondary fallback). `if: always()` so we get it
-      #         even if a later step fails.
+      # Step 6: Upload staging as a workflow artifact (for debugging).
       # ------------------------------------------------------------------
       - name: Upload staging as workflow artifact
         if: always() && steps.check.outputs.exists != 'true'
@@ -413,8 +470,7 @@ jobs:
           retention-days: 14
 
       # ------------------------------------------------------------------
-      # Step 7: Build host zic (timezone compiler, must run on the build
-      #         machine). zic is needed by postgres's configure/make.
+      # Step 7: Build host zic (timezone compiler).
       # ------------------------------------------------------------------
       - name: Download postgresql source
         shell: bash
@@ -442,6 +498,13 @@ jobs:
 
       # ------------------------------------------------------------------
       # Step 8: Cross-compile postgres itself, partial-static-link style.
+      #
+      # CHANGED: STATIC_LIBS now includes:
+      #   -ltermcap        — after -lreadline -lhistory, to resolve any
+      #                      termcap symbols libreadline.a references
+      #   -lc++_static     — after -Wl,-Bdynamic, to resolve C++ runtime
+      #                      symbols (__cxa_throw, operator new, etc.)
+      #                      that libicui18n.a / libicuuc.a reference
       # ------------------------------------------------------------------
       - name: Configure and build postgres (cross-compile, partial static link)
         shell: bash
@@ -454,18 +517,18 @@ jobs:
           # Partial static link: pull these libs in statically, everything else
           # (libc, libm, libdl, liblog, etc. from bionic) stays dynamic.
           #
-          # IMPORTANT: this must go into LIBS, not LDFLAGS. configure's
-          # AC_CHECK_LIB probes link a tiny conftest.c as roughly:
-          #   $CC $CFLAGS $LDFLAGS -o conftest conftest.c -lreadline $LIBS
-          # If the -Wl,-Bstatic/-Bdynamic wrapping lives in LDFLAGS, it ends up
-          # positioned *before* the -lreadline that autoconf appends on the
-          # command line itself, so the static/dynamic switch has already been
-          # reset back to dynamic (autoconf's own -lreadline isn't wrapped) by
-          # the time the linker reaches it, and the static .a in our staging
-          # dir is never found by the search. Putting the whole wrapped list in
-          # LIBS instead means it's appended *after* configure's own -lreadline,
-          # so our static copy resolves the symbols first.
-          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -lreadline -lhistory -luuid -lz -Wl,-Bdynamic"
+          # IMPORTANT: this must go into LIBS, not LDFLAGS. See comment below
+          # on autoconf's AC_CHECK_LIB probe ordering.
+          #
+          # IMPORTANT: -ltermcap comes AFTER -lreadline -lhistory because
+          # readline may reference tgetent/tputs/tgoto. Linker resolves
+          # left-to-right, so the resolver lib must come after the consumer.
+          #
+          # IMPORTANT: -lc++_static comes AFTER -Wl,-Bdynamic because it
+          # lives in the NDK sysroot, not in /tmp/staging/lib. In dynamic
+          # mode the linker still falls back to .a if no .so exists, so
+          # libc++_static.a gets pulled in correctly.
+          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -lreadline -lhistory -ltermcap -luuid -lz -Wl,-Bdynamic -lc++_static"
 
           CC="$CC" \
           CPPFLAGS="-I${STAGING}/include -I${STAGING}/include/libxml2" \
@@ -490,6 +553,30 @@ jobs:
 
           make -j"$(nproc)" world-bin
           make install-world-bin DESTDIR=/tmp/pg-install-root
+
+      # ------------------------------------------------------------------
+      # NEW: If configure fails, dump the tail of config.log so the actual
+      # link error is visible in the workflow run output instead of just
+      # "readline library not found".
+      # ------------------------------------------------------------------
+      - name: Dump config.log on configure failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "============================================================"
+          echo "===== config.log: last 400 lines ====="
+          echo "============================================================"
+          tail -400 /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null || echo "(config.log not found)"
+          echo ""
+          echo "============================================================"
+          echo "===== config.log: readline-related entries ====="
+          echo "============================================================"
+          grep -B2 -A40 -i "readline" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -200 || true
+          echo ""
+          echo "============================================================"
+          echo "===== config.log: failed conftest link commands ====="
+          echo "============================================================"
+          grep -E "^(configure:|/opt/android|.*aarch64.*-o conftest)" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -60 || true
 
       # ------------------------------------------------------------------
       # Step 9: Inspect + package + upload the final postgres binaries.
