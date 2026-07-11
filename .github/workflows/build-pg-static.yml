@@ -203,34 +203,32 @@ jobs:
           ls -la /tmp/staging/lib/libuuid.a
 
       # ------------------------------------------------------------------
-      # Build a minimal termcap stub library. libedit-20240808-3.1 has a
-      # HARD requirement on one of: libtinfo / libncurses / libcurses /
-      # libtermcap, checked via AC_SEARCH_LIBS([tgetent], [...]). None of
-      # these exist in the Android NDK, and there's no configure flag to
-      # disable the requirement — so we provide a tiny stub that implements
-      # the 6 termcap functions libedit references (tgetent / tgetflag /
-      # tgetnum / tgetstr / tputs / tgoto) as no-ops.
-      #
-      # We install the SAME .a under all 4 names libedit probes, so whichever
-      # name AC_SEARCH_LIBS settles on, the linker finds it.
+      # Build a minimal termcap stub library AND matching header.
+      # libedit-20240808-3.1 has a HARD requirement on:
+      #   1. tgetent from libtinfo / libncurses / libcurses / libtermcap
+      #      (AC_SEARCH_LIBS)
+      #   2. ncurses.h / curses.h / termcap.h header (AC_CHECK_HEADERS)
+      # Android NDK has neither. We provide both:
+      #   - A tiny termcap.c with 6 no-op functions, installed as 4 .a
+      #     archives under all 4 names libedit probes
+      #   - A minimal termcap.h header installed under all 3 names libedit
+      #     probes (termcap.h, ncurses.h, curses.h)
       #
       # This step is UNCONDITIONAL (no `if:` guard) because it's needed both
       # when deps are freshly built AND when they're downloaded from the
-      # Release (the Release tarball may or may not contain the stub
-      # depending on which version of this workflow produced it).
+      # Release.
       # ------------------------------------------------------------------
-      - name: Build minimal termcap stub as libncurses/libtermcap/libtinfo/libcurses
+      - name: Build minimal termcap stub (libs + headers)
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p /tmp/termcap-stub
+          mkdir -p /tmp/termcap-stub /tmp/staging/include /tmp/staging/lib
           cat > /tmp/termcap-stub/termcap.c <<'STUB_EOF'
           /* Minimal termcap stub for Android cross-compile.
            * Provides dummy implementations of termcap functions that
-           * libedit.a (and indirectly libreadline.a) reference at link
-           * time. With these stubs the linker is satisfied; at runtime
-           * psql's line editing goes through the device's own terminal
-           * emulator and these functions are never actually called.
+           * libedit.a references at link time. At runtime psql's line
+           * editing goes through the device's own terminal emulator
+           * and these functions are never actually called.
            */
           int tgetent(char *buf, const char *name) { (void)buf; (void)name; return 1; }
           int tgetflag(const char *id) { (void)id; return 0; }
@@ -243,12 +241,47 @@ jobs:
             (void)col; (void)row; return (char *)cm;
           }
           STUB_EOF
+
+          # Minimal termcap.h — just enough to satisfy libedit's #include
+          # and AC_CHECK_HEADERS. libedit only uses tgetent / tgetflag /
+          # tgetnum / tgetstr / tputs / tgoto, so we only need to declare
+          # those.
+          cat > /tmp/termcap-stub/termcap.h <<'HDR_EOF'
+          #ifndef _FAKE_TERMCAP_H
+          #define _FAKE_TERMCAP_H
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          int     tgetent(char *buf, const char *name);
+          int     tgetflag(const char *id);
+          int     tgetnum(const char *id);
+          char   *tgetstr(const char *id, char **area);
+          int     tputs(const char *cp, int affcnt, int (*outc)(int));
+          char   *tgoto(const char *cm, int col, int row);
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif /* _FAKE_TERMCAP_H */
+          HDR_EOF
+
+          # Install header under all 3 names libedit probes
+          for hdr in termcap.h ncurses.h curses.h; do
+            cp /tmp/termcap-stub/termcap.h /tmp/staging/include/$hdr
+          done
+
+          # Compile the stub and install as 4 .a archives under all 4
+          # names libedit's AC_SEARCH_LIBS probes
           $CC -c /tmp/termcap-stub/termcap.c -o /tmp/termcap-stub/termcap.o
-          # Install the same .a under all 4 names libedit probes
           for name in libncurses libcurses libtermcap libtinfo; do
             $AR rcs /tmp/staging/lib/${name}.a /tmp/termcap-stub/termcap.o
             $RANLIB /tmp/staging/lib/${name}.a
           done
+
+          echo "===== installed headers ====="
+          ls -la /tmp/staging/include/termcap.h \
+                 /tmp/staging/include/ncurses.h \
+                 /tmp/staging/include/curses.h
+          echo "===== installed stub archives ====="
           ls -la /tmp/staging/lib/libncurses.a /tmp/staging/lib/libtermcap.a \
                  /tmp/staging/lib/libtinfo.a  /tmp/staging/lib/libcurses.a
           echo "===== libncurses.a (stub) symbols ====="
@@ -454,7 +487,9 @@ jobs:
           exit 1
 
       # ------------------------------------------------------------------
-      # Step 5: Verify staging dir has all required static libs.
+      # Step 5: Verify staging dir has all required static libs AND the
+      #         termcap/ncurses/curses headers that libedit needed at
+      #         build time. Fail fast if anything's missing.
       # ------------------------------------------------------------------
       - name: Verify staging contents
         shell: bash
@@ -462,6 +497,11 @@ jobs:
           set -euo pipefail
           echo "::group::Staging lib dir"
           ls -la /tmp/staging/lib/ | head -40
+          echo "::endgroup::"
+          echo "::group::Staging include dir (termcap-related)"
+          ls -la /tmp/staging/include/termcap.h \
+                 /tmp/staging/include/ncurses.h \
+                 /tmp/staging/include/curses.h 2>/dev/null || true
           echo "::endgroup::"
           missing=0
           for lib in libz.a libuuid.a libedit.a libxml2.a \
@@ -472,11 +512,17 @@ jobs:
               missing=1
             fi
           done
+          for hdr in termcap.h ncurses.h curses.h; do
+            if [ ! -f "/tmp/staging/include/$hdr" ]; then
+              echo "::error::Missing required header: $hdr"
+              missing=1
+            fi
+          done
           if [ "$missing" != "0" ]; then
-            echo "::error::One or more required static libs are missing — aborting before postgres build."
+            echo "::error::One or more required static libs or headers are missing — aborting before postgres build."
             exit 1
           fi
-          echo "All required static libs present."
+          echo "All required static libs and termcap headers present."
 
       # ------------------------------------------------------------------
       # Step 6: Upload staging as a workflow artifact (for debugging).
