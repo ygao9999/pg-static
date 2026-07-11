@@ -664,17 +664,17 @@ jobs:
 
           echo ""
           echo "============================================"
-          echo "Test 4: -ledit -lncurses -lc++_static -latomic -landroid_support"
+          echo "Test 4: -ledit -lncurses -lc++_static -latomic"
           echo "============================================"
           $CC -I"$STAGING/include" -L"$STAGING/lib" \
             /tmp/rl_conftest.c -o /tmp/rl_test4 \
-            -ledit -lncurses -lc++_static -latomic -landroid_support 2>&1 || echo ">>> Test 4 FAILED"
+            -ledit -lncurses -lc++_static -latomic 2>&1 || echo ">>> Test 4 FAILED"
 
           echo ""
           echo "============================================"
           echo "Test 5: full STATIC_LIBS (same as postgres configure will use)"
           echo "============================================"
-          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic -lc++_static -latomic -landroid_support"
+          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic -lc++_static -latomic"
           $CC -I"$STAGING/include" -I"$STAGING/include/libxml2" -L"$STAGING/lib" \
             /tmp/rl_conftest.c -o /tmp/rl_test5 \
             $STATIC_LIBS 2>&1 || echo ">>> Test 5 FAILED"
@@ -733,12 +733,16 @@ jobs:
           #       install a tiny stub as libncurses.a (and 3 other names) and
           #       link it here right after -ledit.
           #
-          # NOTE: -lc++_static -latomic -landroid_support come after
-          #       -Wl,-Bdynamic because they live in the NDK sysroot, not in
-          #       /tmp/staging/lib. They resolve C++ runtime symbols
-          #       (__cxa_throw, operator new, __atomic_fetch_add_8, etc.)
-          #       that libicui18n.a / libicuuc.a reference.
-          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic -lc++_static -latomic -landroid_support"
+          # NOTE: -lc++_static -latomic come after -Wl,-Bdynamic because
+          #       they live in the NDK sysroot, not in /tmp/staging/lib.
+          #       They resolve C++ runtime symbols (__cxa_throw, operator
+          #       new, __atomic_fetch_add_8, etc.) that libicui18n.a /
+          #       libicuuc.a reference.
+          #
+          # NOTE: -landroid_support is NOT included — it was removed from
+          #       NDK r17+ and doesn't exist in NDK r27c. On aarch64 with
+          #       API 24+, bionic provides everything needed natively.
+          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic -lc++_static -latomic"
 
           CC="$CC" \
           CPPFLAGS="-I${STAGING}/include -I${STAGING}/include/libxml2" \
@@ -751,7 +755,8 @@ jobs:
             --with-openssl \
             --with-libxml \
             --with-icu \
-            --with-libedit \
+            --with-readline \
+            --with-libedit-preferred \
             --with-uuid=e2fs \
             --without-perl \
             --without-python \
