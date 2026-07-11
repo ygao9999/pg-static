@@ -1,10 +1,10 @@
-name: "Build static postgres deps - merged pipeline"
+name: "Build static postgres deps - libedit variant"
 
 on:
   workflow_dispatch:
     inputs:
       force_rebuild_deps:
-        description: "Force rebuilding the 6 static deps even if a deps release already exists"
+        description: "Force rebuilding the static deps even if a deps release already exists"
         type: boolean
         default: false
   push:
@@ -19,7 +19,7 @@ permissions:
 env:
   ANDROID_API: 24
   NDK_VERSION: r27c
-  DEPS_RELEASE_TAG: deps-baseline-v1
+  DEPS_RELEASE_TAG: deps-baseline-v2
   PG_VERSION: "18.2"
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ------------------------------------------------------------------
-      # Step 1: Decide whether we need to rebuild the 6 static deps.
+      # Step 1: Decide whether we need to rebuild the static deps.
       # ------------------------------------------------------------------
       - name: Check whether deps release already has the staging asset
         id: check
@@ -154,7 +154,11 @@ jobs:
           exit 1
 
       # ------------------------------------------------------------------
-      # Step 3b: Build all 6 static deps from source.
+      # Step 3b: Build all static deps from source.
+      #          NOTE: readline + termcap stub REMOVED. libedit is now used
+      #          instead — it has built-in terminal handling, zero external
+      #          termcap dependency, and PostgreSQL supports it natively
+      #          via --with-libedit.
       # ------------------------------------------------------------------
       - name: Build static zlib
         if: steps.check.outputs.exists != 'true'
@@ -198,98 +202,69 @@ jobs:
           make -C lib/uuid install
           ls -la /tmp/staging/lib/libuuid.a
 
-      - name: Build static readline
+      - name: Build static libedit
         if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
           cd /tmp
-          curl -fsSL -o readline.tar.gz https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz
-          tar xf readline.tar.gz
-          cd readline-8.3
+          curl -fsSL -o libedit.tar.gz \
+            "https://thrysoee.dk/editline/libedit-20240808-3.1.tar.gz"
+          tar xf libedit.tar.gz
+          cd libedit-20240808-3.1
+
+          # IMPORTANT: libedit normally uses system termcap (tgetent/tputs/etc.)
+          # via -ltermcap or -lncurses, neither of which exists in Android NDK.
+          # Setting ac_cv_func_tgetent=no forces libedit's configure to use
+          # its own internal terminal stub (terminal.c), which is a no-op
+          # implementation that's perfectly fine for psql's line-editing use
+          # case (psql doesn't actually move the cursor via termcap sequences
+          # when running non-interactively, and interactive use will go through
+          # the device's own terminal emulator anyway).
+          #
+          # We also disable wide-char support for safety — some wcwidth-like
+          # functions may behave differently on API 24 bionic. libedit works
+          # fine in 8-bit mode for psql's needs.
           CC="$CC" AR="$AR" RANLIB="$RANLIB" \
+            ac_cv_func_tgetent=no \
             bash_cv_termcap_lib=none \
-            bash_cv_signed_chars=yes \
-            bash_cv_must_reinstall_sighandlers=no \
-            bash_cv_wcwidth_broken=no \
             ./configure \
               --host=aarch64-linux-android \
               --prefix=/tmp/staging \
               --disable-shared \
               --enable-static \
-              --with-curses=no \
-              --without-purify
-          make -j"$(nproc)" SHLIB_LIBS=""
-          make install SHLIB_LIBS=""
-          ls -la /tmp/staging/lib/libreadline.a /tmp/staging/lib/libhistory.a
+              --without-termcap \
+              --disable-wide-character
+          make -j"$(nproc)"
+          make install
+          ls -la /tmp/staging/lib/libedit.a
+          ls -la /tmp/staging/include/editline/readline.h
 
       # ------------------------------------------------------------------
-      # NEW: Verify libreadline.a actually contains the symbols postgres
-      # will look for. Fail fast if the build silently produced an empty
-      # or partial archive.
+      # Verify libedit.a actually contains the symbols postgres will look
+      # for. Fail fast if the build silently produced an empty or partial
+      # archive.
       # ------------------------------------------------------------------
-      - name: Verify readline static lib symbols
+      - name: Verify libedit static lib symbols
         if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
           set -euxo pipefail
           NM="$NDK_TOOLCHAIN/bin/llvm-nm"
-          echo "===== libreadline.a symbols (T = text/defined) ====="
-          "$NM" /tmp/staging/lib/libreadline.a | grep -E "^[0-9a-f]+ T " | head -40
+          echo "===== libedit.a defined symbols (T) ====="
+          "$NM" /tmp/staging/lib/libedit.a | grep -E "^[0-9a-f]+ T " | head -40
           echo "===== checking required symbols ====="
-          for sym in readline rl_completion_matches rl_filename_completion_function; do
-            if "$NM" /tmp/staging/lib/libreadline.a 2>/dev/null | grep -qE " T ${sym}$"; then
-              echo "OK: $sym found in libreadline.a"
+          for sym in readline rl_completion_matches rl_filename_completion_function add_history read_history; do
+            if "$NM" /tmp/staging/lib/libedit.a 2>/dev/null | grep -qE " T ${sym}$"; then
+              echo "OK: $sym found in libedit.a"
             else
-              echo "::error::Missing symbol in libreadline.a: $sym"
-              # Also check undefined symbols (U) to see what readline wants
-              echo "----- undefined symbols (U) referenced by libreadline.a -----"
-              "$NM" /tmp/staging/lib/libreadline.a 2>/dev/null | grep -E " U " | sort -u | head -60
+              echo "::error::Missing symbol in libedit.a: $sym"
+              echo "----- undefined symbols (U) referenced by libedit.a -----"
+              "$NM" /tmp/staging/lib/libedit.a 2>/dev/null | grep -E " U " | sort -u | head -60
               exit 1
             fi
           done
-
-      # ------------------------------------------------------------------
-      # NEW: Build a minimal libtermcap.a stub. Even though readline was
-      # configured with bash_cv_termcap_lib=none, in practice libreadline.a
-      # on Android still ends up with unresolved references to tgetent /
-      # tputs / tgoto etc. (readline's own termcap.c stub isn't always
-      # compiled in). This tiny stub resolves them with no-op returns.
-          #
-      # This stub is also what postgres's AC_SEARCH_LIBS([tgetent],
-      # [termcap ...]) will find as "-ltermcap" if it probes for termcap
-      # separately before probing for readline.
-      # ------------------------------------------------------------------
-      - name: Build minimal termcap stub library
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p /tmp/termcap-stub
-          cat > /tmp/termcap-stub/termcap.c <<'STUB_EOF'
-          /* Minimal termcap stub for Android cross-compile.
-           * Provides dummy implementations of termcap functions that
-           * libreadline.a may reference at link time. With
-           * bash_cv_termcap_lib=none, readline uses its own terminal
-           * handling at runtime, so these are never actually called —
-           * they just need to exist for static link resolution.
-           */
-          int tgetent(char *buf, const char *name) { (void)buf; (void)name; return 1; }
-          int tgetflag(const char *id) { (void)id; return 0; }
-          int tgetnum(const char *id) { (void)id; return -1; }
-          char *tgetstr(const char *id, char **area) { (void)id; (void)area; return (char *)0; }
-          int tputs(const char *cp, int affcnt, int (*outc)(int)) {
-            (void)cp; (void)affcnt; (void)outc; return 0;
-          }
-          char *tgoto(const char *cm, int col, int row) {
-            (void)col; (void)row; return (char *)cm;
-          }
-          STUB_EOF
-          $CC -c /tmp/termcap-stub/termcap.c -o /tmp/termcap-stub/termcap.o
-          $AR rcs /tmp/staging/lib/libtermcap.a /tmp/termcap-stub/termcap.o
-          $RANLIB /tmp/staging/lib/libtermcap.a
-          ls -la /tmp/staging/lib/libtermcap.a
-          echo "===== libtermcap.a symbols ====="
-          "$NDK_TOOLCHAIN/bin/llvm-nm" /tmp/staging/lib/libtermcap.a
+          echo "All required libedit symbols present."
 
       - name: Build static libxml2
         if: steps.check.outputs.exists != 'true'
@@ -408,8 +383,8 @@ jobs:
           else
             gh release create "$DEPS_RELEASE_TAG" /tmp/staging-stage1.tar.gz \
               --repo "${{ github.repository }}" \
-              --title "Static deps baseline (zlib/uuid/readline/libxml2/openssl/icu/termcap-stub)" \
-              --notes "Auto-published by build-pg-static.yml. Contains staging-stage1.tar.gz with statically-built libs for aarch64-android (API ${{ env.ANDROID_API }})."
+              --title "Static deps baseline v2 (zlib/uuid/libedit/libxml2/openssl/icu)" \
+              --notes "Auto-published by build-pg-static.yml. Contains staging-stage1.tar.gz with statically-built libs for aarch64-android (API ${{ env.ANDROID_API }}). Uses libedit (not readline) for line editing."
           fi
 
       - name: Verify Release asset published (poll for visibility)
@@ -442,9 +417,8 @@ jobs:
           ls -la /tmp/staging/lib/ | head -40
           echo "::endgroup::"
           missing=0
-          for lib in libz.a libuuid.a libreadline.a libhistory.a libxml2.a \
-                     libssl.a libcrypto.a libicuuc.a libicui18n.a libicudata.a \
-                     libtermcap.a; do
+          for lib in libz.a libuuid.a libedit.a libxml2.a \
+                     libssl.a libcrypto.a libicuuc.a libicui18n.a libicudata.a; do
             if [ ! -f "/tmp/staging/lib/$lib" ]; then
               echo "::error::Missing required static lib: $lib"
               missing=1
@@ -454,7 +428,7 @@ jobs:
             echo "::error::One or more required static libs are missing — aborting before postgres build."
             exit 1
           fi
-          echo "All required static libs present (including libtermcap.a stub)."
+          echo "All required static libs present."
 
       # ------------------------------------------------------------------
       # Step 6: Upload staging as a workflow artifact (for debugging).
@@ -496,14 +470,104 @@ jobs:
           file src/timezone/zic
 
       # ------------------------------------------------------------------
+      # NEW: Diagnostic - standalone libedit link test BEFORE postgres
+      #      configure. This runs the same link that AC_SEARCH_LIBS will
+      #      do, but with verbose output so we can see EXACTLY which
+      #      symbol is unresolved. If this fails, postgres configure
+      #      will definitely fail too.
+      # ------------------------------------------------------------------
+      - name: Diagnostic - standalone libedit link test
+        shell: bash
+        run: |
+          set -euxo pipefail
+          STAGING=/tmp/staging
+          NM="$NDK_TOOLCHAIN/bin/llvm-nm"
+
+          # Minimal conftest — exactly what AC_SEARCH_LIBS([readline],[edit]) does
+          cat > /tmp/rl_conftest.c <<'EOF'
+          char readline(void);
+          int main(void) { return (int)(long)readline(); }
+          EOF
+
+          echo ""
+          echo "============================================"
+          echo "Step 0: Undefined symbols referenced by libedit.a"
+          echo "============================================"
+          "$NM" "$STAGING/lib/libedit.a" 2>/dev/null | grep ' U ' | sort -u
+
+          echo ""
+          echo "============================================"
+          echo "Test 1: -ledit only"
+          echo "============================================"
+          $CC -I"$STAGING/include" -L"$STAGING/lib" \
+            /tmp/rl_conftest.c -o /tmp/rl_test1 \
+            -ledit 2>&1 || echo ">>> Test 1 FAILED"
+
+          echo ""
+          echo "============================================"
+          echo "Test 2: -ledit -lc++_static"
+          echo "============================================"
+          $CC -I"$STAGING/include" -L"$STAGING/lib" \
+            /tmp/rl_conftest.c -o /tmp/rl_test2 \
+            -ledit -lc++_static 2>&1 || echo ">>> Test 2 FAILED"
+
+          echo ""
+          echo "============================================"
+          echo "Test 3: -ledit -lc++_static -latomic"
+          echo "============================================"
+          $CC -I"$STAGING/include" -L"$STAGING/lib" \
+            /tmp/rl_conftest.c -o /tmp/rl_test3 \
+            -ledit -lc++_static -latomic 2>&1 || echo ">>> Test 3 FAILED"
+
+          echo ""
+          echo "============================================"
+          echo "Test 4: -ledit -lc++_static -latomic -landroid_support"
+          echo "============================================"
+          $CC -I"$STAGING/include" -L"$STAGING/lib" \
+            /tmp/rl_conftest.c -o /tmp/rl_test4 \
+            -ledit -lc++_static -latomic -landroid_support 2>&1 || echo ">>> Test 4 FAILED"
+
+          echo ""
+          echo "============================================"
+          echo "Test 5: full STATIC_LIBS (same as postgres configure will use)"
+          echo "============================================"
+          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -luuid -lz -Wl,-Bdynamic -lc++_static -latomic -landroid_support"
+          $CC -I"$STAGING/include" -I"$STAGING/include/libxml2" -L"$STAGING/lib" \
+            /tmp/rl_conftest.c -o /tmp/rl_test5 \
+            $STATIC_LIBS 2>&1 || echo ">>> Test 5 FAILED"
+
+          echo ""
+          echo "============================================"
+          echo "Test 6: explicit .a paths (bypass -Bstatic/-Bdynamic entirely)"
+          echo "============================================"
+          $CC -I"$STAGING/include" \
+            /tmp/rl_conftest.c -o /tmp/rl_test6 \
+            "$STAGING/lib/libedit.a" \
+            -lc++_static -latomic 2>&1 || echo ">>> Test 6 FAILED"
+
+          echo ""
+          echo "============================================"
+          echo "Summary of which tests succeeded:"
+          echo "============================================"
+          for i in 1 2 3 4 5 6; do
+            if [ -f "/tmp/rl_test$i" ]; then
+              echo "  Test $i: OK ($(file /tmp/rl_test$i | cut -d: -f2))"
+            else
+              echo "  Test $i: FAILED"
+            fi
+          done
+
+          # Don't fail the workflow even if all tests fail — we want to
+          # see the diagnostic output, then let the postgres configure
+          # step produce its own error + config.log dump.
+          exit 0
+
+      # ------------------------------------------------------------------
       # Step 8: Cross-compile postgres itself, partial-static-link style.
       #
-      # CHANGED: STATIC_LIBS now includes:
-      #   -ltermcap        — after -lreadline -lhistory, to resolve any
-      #                      termcap symbols libreadline.a references
-      #   -lc++_static     — after -Wl,-Bdynamic, to resolve C++ runtime
-      #                      symbols (__cxa_throw, operator new, etc.)
-      #                      that libicui18n.a / libicuuc.a reference
+      # CHANGED: --with-readline replaced with --with-libedit.
+      #          STATIC_LIBS simplified: -lreadline -lhistory -ltermcap
+      #          replaced by single -ledit.
       # ------------------------------------------------------------------
       - name: Configure and build postgres (cross-compile, partial static link)
         shell: bash
@@ -516,18 +580,18 @@ jobs:
           # Partial static link: pull these libs in statically, everything else
           # (libc, libm, libdl, liblog, etc. from bionic) stays dynamic.
           #
-          # IMPORTANT: this must go into LIBS, not LDFLAGS. See comment below
-          # on autoconf's AC_CHECK_LIB probe ordering.
+          # IMPORTANT: this must go into LIBS, not LDFLAGS. See comment in
+          # previous versions on autoconf's AC_CHECK_LIB probe ordering.
           #
-          # IMPORTANT: -ltermcap comes AFTER -lreadline -lhistory because
-          # readline may reference tgetent/tputs/tgoto. Linker resolves
-          # left-to-right, so the resolver lib must come after the consumer.
+          # NOTE: -ledit replaces the old -lreadline -lhistory -ltermcap combo.
+          #       libedit is self-contained (no external termcap needed).
           #
-          # IMPORTANT: -lc++_static comes AFTER -Wl,-Bdynamic because it
-          # lives in the NDK sysroot, not in /tmp/staging/lib. In dynamic
-          # mode the linker still falls back to .a if no .so exists, so
-          # libc++_static.a gets pulled in correctly.
-          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -lreadline -lhistory -ltermcap -luuid -lz -Wl,-Bdynamic -lc++_static"
+          # NOTE: -lc++_static -latomic -landroid_support come after
+          #       -Wl,-Bdynamic because they live in the NDK sysroot, not in
+          #       /tmp/staging/lib. They resolve C++ runtime symbols
+          #       (__cxa_throw, operator new, __atomic_fetch_add_8, etc.)
+          #       that libicui18n.a / libicuuc.a reference.
+          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -luuid -lz -Wl,-Bdynamic -lc++_static -latomic -landroid_support"
 
           CC="$CC" \
           CPPFLAGS="-I${STAGING}/include -I${STAGING}/include/libxml2" \
@@ -540,7 +604,7 @@ jobs:
             --with-openssl \
             --with-libxml \
             --with-icu \
-            --with-readline \
+            --with-libedit \
             --with-uuid=e2fs \
             --without-perl \
             --without-python \
@@ -554,28 +618,36 @@ jobs:
           make install-world-bin DESTDIR=/tmp/pg-install-root
 
       # ------------------------------------------------------------------
-      # NEW: If configure fails, dump the tail of config.log so the actual
+      # If configure fails, dump the tail of config.log so the actual
       # link error is visible in the workflow run output instead of just
-      # "readline library not found".
+      # "libedit library not found" / "readline library not found".
       # ------------------------------------------------------------------
       - name: Dump config.log on configure failure
         if: failure()
         shell: bash
         run: |
           echo "============================================================"
-          echo "===== config.log: last 400 lines ====="
+          echo "===== config.log: last 600 lines ====="
           echo "============================================================"
-          tail -400 /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null || echo "(config.log not found)"
+          tail -600 /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null || echo "(config.log not found)"
+
           echo ""
           echo "============================================================"
-          echo "===== config.log: readline-related entries ====="
+          echo "===== config.log: readline/edit/libedit conftest section ====="
           echo "============================================================"
-          grep -B2 -A40 -i "readline" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -200 || true
+          grep -n -iE "readline|libedit|editline" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -30
+
           echo ""
           echo "============================================================"
-          echo "===== config.log: failed conftest link commands ====="
+          echo "===== config.log: all 'undefined reference' errors ====="
           echo "============================================================"
-          grep -E "^(configure:|/opt/android|.*aarch64.*-o conftest)" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -60 || true
+          grep -i "undefined reference\|cannot find\|error:" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | sort -u | tail -80
+
+          echo ""
+          echo "============================================================"
+          echo "===== config.log: failed link commands (last 10) ====="
+          echo "============================================================"
+          grep -E "aarch64.*-o conftest|aarch64.*conftest.*\.c" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -10
 
       # ------------------------------------------------------------------
       # Step 9: Inspect + package + upload the final postgres binaries.
