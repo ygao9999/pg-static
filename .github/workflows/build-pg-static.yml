@@ -374,21 +374,31 @@ jobs:
         if: steps.check.outputs.exists != 'true'
         shell: bash
         run: |
-          set -euxo pipefail
+          # NOTE: do NOT use `set -o pipefail` here. The `nm | grep | head`
+          # pattern breaks under pipefail because head closes the pipe early
+          # (after N lines), grep receives SIGPIPE and exits non-zero, which
+          # pipefail propagates as a step failure — even though the build
+          # itself succeeded. We use `set -eu` only and add `|| true` to
+          # head pipelines as belt-and-suspenders.
+          set -eu
           NM="$NDK_TOOLCHAIN/bin/llvm-nm"
-          echo "===== libedit.a defined symbols (T) ====="
-          "$NM" /tmp/staging/lib/libedit.a | grep -E "^[0-9a-f]+ T " | head -40
+          echo "===== libedit.a defined symbols (T), first 40 ====="
+          "$NM" /tmp/staging/lib/libedit.a | grep -E "^[0-9a-f]+ T " | head -40 || true
           echo "===== checking required symbols ====="
+          missing=0
           for sym in readline rl_completion_matches rl_filename_completion_function add_history read_history; do
             if "$NM" /tmp/staging/lib/libedit.a 2>/dev/null | grep -qE " T ${sym}$"; then
               echo "OK: $sym found in libedit.a"
             else
               echo "::error::Missing symbol in libedit.a: $sym"
-              echo "----- undefined symbols (U) referenced by libedit.a -----"
-              "$NM" /tmp/staging/lib/libedit.a 2>/dev/null | grep -E " U " | sort -u | head -60
-              exit 1
+              missing=1
             fi
           done
+          if [ "$missing" != "0" ]; then
+            echo "----- undefined symbols (U) referenced by libedit.a -----"
+            "$NM" /tmp/staging/lib/libedit.a 2>/dev/null | grep -E " U " | sort -u | head -60 || true
+            exit 1
+          fi
           echo "All required libedit symbols present."
 
       - name: Build static libxml2
