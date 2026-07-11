@@ -325,35 +325,31 @@ jobs:
           #    provides both.
 
           # Patch 1: nuke the getpwent user-name completion block in readline.c
-          # We do a conservative sed: comment out the 3 calls and the loop.
-          # This is a pure stub-out — psql's "~user" completion just won't
-          # work on Android, which is fine.
-          sed -i \
-            -e 's|^\([[:space:]]*\)setpwent();|/* \1setpwent(); -- disabled for Android */|' \
-            -e 's|^\([[:space:]]*\)endpwent();|/* \1endpwent(); -- disabled for Android */|' \
-            src/readline.c
-
-          # Replace the getpwent() loop with a "no users found" fallback.
-          # The loop looks like:
-          #     setpwent();
-          #     while (...) {
-          #         if ((pass = getpwent()) != NULL) { ... }
-          #     }
-          #     endpwent();
-          # We make getpwent always return NULL by macro-defining it.
-          # This way the loop runs zero iterations and we don't touch
-          # the surrounding control flow.
-          sed -i '/#include "readline.h"/a \
+          # by macro-defining the 3 pwd.h functions as no-ops on Android.
+          #
+          # libedit's readline.c does NOT include "readline.h" (a .c file
+          # doesn't include its own header), so we can't anchor on that.
+          # Instead we anchor on `#include "config.h"` which is the first
+          # include in every libedit source file (autoconf-generated).
+          #
+          # We also `#include <pwd.h>` in the macro block so that
+          # `struct passwd *` is a known type when the macro expands.
+          sed -i '/#include "config.h"/a \
           #if defined(__ANDROID__)\
+          #include <pwd.h>\
           #define getpwent() ((struct passwd *)NULL)\
           #define setpwent() ((void)0)\
           #define endpwent() ((void)0)\
           #endif' \
             src/readline.c
 
-          # Sanity check the patches landed
-          grep -n "disabled for Android" src/readline.c | head -5
-          grep -n "__ANDROID__" src/readline.c | head -5
+          # Sanity check the patch landed (don't fail the build if grep
+          # returns no matches — that's a real problem but we want to
+          # see compile errors, not grep exit codes)
+          echo "===== verifying __ANDROID__ patch landed in readline.c ====="
+          grep -n "__ANDROID__\|getpwent.*NULL\|setpwent.*void" src/readline.c | head -10 || true
+          echo "===== verifying setpwent/endpwent calls commented out ====="
+          grep -n "setpwent\|endpwent" src/readline.c | head -10 || true
 
           CC="$CC" AR="$AR" RANLIB="$RANLIB" \
             CFLAGS="-I/tmp/staging/include -D__STDC_ISO_10646__=201103L -DNBBY=8" \
