@@ -636,11 +636,11 @@ jobs:
           echo "============================================"
           echo "Step 0: Undefined symbols referenced by libedit.a"
           echo "============================================"
-          "$NM" "$STAGING/lib/libedit.a" 2>/dev/null | grep ' U ' | sort -u
+          "$NM" "$STAGING/lib/libedit.a" 2>/dev/null | grep ' U ' | sort -u || true
 
           echo ""
           echo "============================================"
-          echo "Test 1: -ledit -lncurses"
+          echo "Test 1: -ledit -lncurses only"
           echo "============================================"
           $CC -I"$STAGING/include" -L"$STAGING/lib" \
             /tmp/rl_conftest.c -o /tmp/rl_test1 \
@@ -648,52 +648,32 @@ jobs:
 
           echo ""
           echo "============================================"
-          echo "Test 2: -ledit -lncurses -lc++_static"
+          echo "Test 2: full STATIC_LIBS (with ICU + C++ runtime via full paths)"
           echo "============================================"
-          $CC -I"$STAGING/include" -L"$STAGING/lib" \
-            /tmp/rl_conftest.c -o /tmp/rl_test2 \
-            -ledit -lncurses -lc++_static 2>&1 || echo ">>> Test 2 FAILED"
-
-          echo ""
-          echo "============================================"
-          echo "Test 3: -ledit -lncurses -lc++_static -latomic"
-          echo "============================================"
-          $CC -I"$STAGING/include" -L"$STAGING/lib" \
-            /tmp/rl_conftest.c -o /tmp/rl_test3 \
-            -ledit -lncurses -lc++_static -latomic 2>&1 || echo ">>> Test 3 FAILED"
-
-          echo ""
-          echo "============================================"
-          echo "Test 4: -ledit -lncurses -lc++_static -latomic"
-          echo "============================================"
-          $CC -I"$STAGING/include" -L"$STAGING/lib" \
-            /tmp/rl_conftest.c -o /tmp/rl_test4 \
-            -ledit -lncurses -lc++_static -latomic 2>&1 || echo ">>> Test 4 FAILED"
-
-          echo ""
-          echo "============================================"
-          echo "Test 5: full STATIC_LIBS (same as postgres configure will use)"
-          echo "============================================"
-          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic -lc++_static -latomic"
+          CXX_STATIC_PATH=$("$CXX" -print-file-name=libc++_static.a 2>/dev/null || echo "libc++_static.a")
+          ATOMIC_PATH=$("$CC" -print-file-name=libatomic.a 2>/dev/null || echo "libatomic.a")
+          echo "  CXX_STATIC_PATH=$CXX_STATIC_PATH"
+          echo "  ATOMIC_PATH=$ATOMIC_PATH"
+          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic ${CXX_STATIC_PATH} ${ATOMIC_PATH}"
           $CC -I"$STAGING/include" -I"$STAGING/include/libxml2" -L"$STAGING/lib" \
-            /tmp/rl_conftest.c -o /tmp/rl_test5 \
-            $STATIC_LIBS 2>&1 || echo ">>> Test 5 FAILED"
+            /tmp/rl_conftest.c -o /tmp/rl_test2 \
+            $STATIC_LIBS 2>&1 || echo ">>> Test 2 FAILED"
 
           echo ""
           echo "============================================"
-          echo "Test 6: explicit .a paths (bypass -Bstatic/-Bdynamic entirely)"
+          echo "Test 3: explicit .a paths (bypass -Bstatic/-Bdynamic entirely)"
           echo "============================================"
           $CC -I"$STAGING/include" \
-            /tmp/rl_conftest.c -o /tmp/rl_test6 \
+            /tmp/rl_conftest.c -o /tmp/rl_test3 \
             "$STAGING/lib/libedit.a" \
             "$STAGING/lib/libncurses.a" \
-            -lc++_static -latomic 2>&1 || echo ">>> Test 6 FAILED"
+            ${CXX_STATIC_PATH} ${ATOMIC_PATH} 2>&1 || echo ">>> Test 3 FAILED"
 
           echo ""
           echo "============================================"
           echo "Summary of which tests succeeded:"
           echo "============================================"
-          for i in 1 2 3 4 5 6; do
+          for i in 1 2 3; do
             if [ -f "/tmp/rl_test$i" ]; then
               echo "  Test $i: OK ($(file /tmp/rl_test$i | cut -d: -f2))"
             else
@@ -721,6 +701,57 @@ jobs:
 
           STAGING=/tmp/staging
 
+          # ---- Find exact paths of NDK-internal static libs ----
+          #
+          # The NDK's C compiler (clang, not clang++) doesn't always have
+          # libc++_static.a in its default -l search path. The C++ compiler
+          # (clang++) knows where it is, so we use -print-file-name to get
+          # the exact path. Same for libatomic.a.
+          #
+          # This is critical because postgres configure's very first check
+          # ("C compiler still works") links a bare conftest with $LIBS,
+          # which includes our STATIC_LIBS. If -lc++_static can't be found,
+          # that check fails with "C compiler cannot create executables"
+          # → exit 77.
+          CXX_STATIC_PATH=$("$CXX" -print-file-name=libc++_static.a 2>/dev/null || echo "")
+          ATOMIC_PATH=$("$CC" -print-file-name=libatomic.a 2>/dev/null || echo "")
+          echo "CXX_STATIC_PATH = $CXX_STATIC_PATH"
+          echo "ATOMIC_PATH     = $ATOMIC_PATH"
+
+          # If -print-file-name returned just the basename (not found),
+          # search common NDK paths as fallback.
+          if [ ! -f "$CXX_STATIC_PATH" ]; then
+            for p in \
+              "$NDK_TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android" \
+              "$NDK_TOOLCHAIN/lib/clang"/*/lib/linux; do
+              if [ -f "$p/libc++_static.a" ]; then
+                CXX_STATIC_PATH="$p/libc++_static.a"
+                break
+              fi
+            done
+          fi
+          if [ ! -f "$ATOMIC_PATH" ]; then
+            for p in \
+              "$NDK_TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android" \
+              "$NDK_TOOLCHAIN/lib/clang"/*/lib/linux; do
+              if [ -f "$p/libatomic.a" ]; then
+                ATOMIC_PATH="$p/libatomic.a"
+                break
+              fi
+            done
+          fi
+          if [ ! -f "$CXX_STATIC_PATH" ]; then
+            echo "::error::Cannot find libc++_static.a anywhere in NDK"
+            find "$NDK_TOOLCHAIN" -name "libc++_static*" 2>/dev/null | head -10
+            exit 1
+          fi
+          if [ ! -f "$ATOMIC_PATH" ]; then
+            echo "::warning::Cannot find libatomic.a — omitting (may not be needed on aarch64)"
+            ATOMIC_PATH=""
+          fi
+          echo "Final CXX_STATIC_PATH = $CXX_STATIC_PATH"
+          echo "Final ATOMIC_PATH     = $ATOMIC_PATH"
+
           # Partial static link: pull these libs in statically, everything else
           # (libc, libm, libdl, liblog, etc. from bionic) stays dynamic.
           #
@@ -733,16 +764,23 @@ jobs:
           #       install a tiny stub as libncurses.a (and 3 other names) and
           #       link it here right after -ledit.
           #
-          # NOTE: -lc++_static -latomic come after -Wl,-Bdynamic because
-          #       they live in the NDK sysroot, not in /tmp/staging/lib.
-          #       They resolve C++ runtime symbols (__cxa_throw, operator
-          #       new, __atomic_fetch_add_8, etc.) that libicui18n.a /
-          #       libicuuc.a reference.
+          # NOTE: libc++_static.a and libatomic.a are referenced by FULL PATH
+          #       (not -lc++_static) because the NDK's C compiler doesn't
+          #       always have them in its -l search path. They come AFTER
+          #       -Wl,-Bdynamic because they live in the NDK sysroot, not in
+          #       /tmp/staging/lib. They resolve C++ runtime symbols
+          #       (__cxa_throw, operator new, __atomic_fetch_add_8, etc.)
+          #       that libicui18n.a / libicuuc.a reference.
           #
           # NOTE: -landroid_support is NOT included — it was removed from
           #       NDK r17+ and doesn't exist in NDK r27c. On aarch64 with
           #       API 24+, bionic provides everything needed natively.
-          STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic -lc++_static -latomic"
+          if [ -n "$ATOMIC_PATH" ]; then
+            STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic ${CXX_STATIC_PATH} ${ATOMIC_PATH}"
+          else
+            STATIC_LIBS="-Wl,-Bstatic -lssl -lcrypto -lxml2 -licui18n -licuuc -licudata -ledit -lncurses -luuid -lz -Wl,-Bdynamic ${CXX_STATIC_PATH}"
+          fi
+          echo "STATIC_LIBS = $STATIC_LIBS"
 
           CC="$CC" \
           CPPFLAGS="-I${STAGING}/include -I${STAGING}/include/libxml2" \
@@ -770,36 +808,43 @@ jobs:
           make install-world-bin DESTDIR=/tmp/pg-install-root
 
       # ------------------------------------------------------------------
-      # If configure fails, dump the tail of config.log so the actual
-      # link error is visible in the workflow run output instead of just
-      # "libedit library not found" / "readline library not found".
+      # If configure fails, dump config.log diagnostics. The LAST 300 lines
+      # are the most important — they contain the actual fatal error that
+      # caused configure to exit. The grep sections help find specific
+      # patterns but may miss the real error.
       # ------------------------------------------------------------------
       - name: Dump config.log on configure failure
         if: failure()
         shell: bash
         run: |
           echo "============================================================"
-          echo "===== config.log: last 600 lines ====="
+          echo "===== config.log: LAST 300 lines (contains the fatal error) ====="
           echo "============================================================"
-          tail -600 /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null || echo "(config.log not found)"
+          tail -300 /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null || echo "(config.log not found)"
 
           echo ""
           echo "============================================================"
-          echo "===== config.log: readline/edit/libedit conftest section ====="
+          echo "===== config.log: all 'configure:.*error' lines (fatal errors) ====="
           echo "============================================================"
-          grep -n -iE "readline|libedit|editline" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -30
+          grep -n "configure:.*error" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -20 || true
 
           echo ""
           echo "============================================================"
-          echo "===== config.log: all 'undefined reference' errors ====="
+          echo "===== config.log: all 'as_fn_error' lines ====="
           echo "============================================================"
-          grep -i "undefined reference\|cannot find\|error:" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | sort -u | tail -80
+          grep -n "as_fn_error" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -20 || true
 
           echo ""
           echo "============================================================"
-          echo "===== config.log: failed link commands (last 10) ====="
+          echo "===== config.log: ld.lld errors (link failures) ====="
           echo "============================================================"
-          grep -E "aarch64.*-o conftest|aarch64.*conftest.*\.c" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | tail -10
+          grep -n "ld.lld: error\|ld: error" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | sort -u | tail -30 || true
+
+          echo ""
+          echo "============================================================"
+          echo "===== config.log: 'unable to find library' errors ====="
+          echo "============================================================"
+          grep -n "unable to find library" /tmp/postgresql-${PG_VERSION}/config.log 2>/dev/null | sort -u || true
 
       # ------------------------------------------------------------------
       # Step 9: Inspect + package + upload the final postgres binaries.
