@@ -304,17 +304,32 @@ jobs:
           # under all 4 names. AC_SEARCH_LIBS([tgetent], [tinfo ncurses
           # curses termcap]) will find one of them via -L/tmp/staging/lib.
           #
-          # --disable-wide-character avoids potential wcwidth / iswblank
-          # issues on API 24 bionic. psql works fine in 8-bit mode.
+          # The CFLAGS/CPPFLAGS need to include:
+          #   -I/tmp/staging/include   — so AC_CHECK_HEADERS finds our
+          #                              termcap.h / ncurses.h / curses.h
+          #                              stub headers
+          #   -D__STDC_ISO_10646__=201103L
+          #                            — bionic's wchar_t IS 4-byte UTF-32
+          #                              (stores ISO 10646 / Unicode), but
+          #                              bionic doesn't define this macro
+          #                              for legacy reasons. libedit's
+          #                              chartype.h has:
+          #                                #if !defined(__STDC_ISO_10646__) \
+          #                                    && !defined(__NetBSD__)
+          #                                # error wchar_t must store \
+          #                                  ISO 10646 characters
+          #                                #endif
+          #                              Defining the macro ourselves tells
+          #                              libedit the truth about bionic.
           CC="$CC" AR="$AR" RANLIB="$RANLIB" \
-            CFLAGS="-I/tmp/staging/include" \
+            CFLAGS="-I/tmp/staging/include -D__STDC_ISO_10646__=201103L" \
+            CPPFLAGS="-I/tmp/staging/include -D__STDC_ISO_10646__=201103L" \
             LDFLAGS="-L/tmp/staging/lib" \
             ./configure \
               --host=aarch64-linux-android \
               --prefix=/tmp/staging \
               --disable-shared \
-              --enable-static \
-              --disable-wide-character
+              --enable-static
           make -j"$(nproc)"
           make install
           ls -la /tmp/staging/lib/libedit.a
