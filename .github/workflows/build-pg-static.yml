@@ -298,32 +298,66 @@ jobs:
           tar xf libedit.tar.gz
           cd libedit-20240808-3.1
 
-          # libedit-20240808-3.1 has a hard requirement on tgetent from
-          # libtinfo / libncurses / libcurses / libtermcap. We satisfy this
-          # by installing a tiny stub library (built in the previous step)
-          # under all 4 names. AC_SEARCH_LIBS([tgetent], [tinfo ncurses
-          # curses termcap]) will find one of them via -L/tmp/staging/lib.
+          # ----- Source patches for Android bionic incompatibilities -----
           #
-          # The CFLAGS/CPPFLAGS need to include:
-          #   -I/tmp/staging/include   — so AC_CHECK_HEADERS finds our
-          #                              termcap.h / ncurses.h / curses.h
-          #                              stub headers
-          #   -D__STDC_ISO_10646__=201103L
-          #                            — bionic's wchar_t IS 4-byte UTF-32
-          #                              (stores ISO 10646 / Unicode), but
-          #                              bionic doesn't define this macro
-          #                              for legacy reasons. libedit's
-          #                              chartype.h has:
-          #                                #if !defined(__STDC_ISO_10646__) \
-          #                                    && !defined(__NetBSD__)
-          #                                # error wchar_t must store \
-          #                                  ISO 10646 characters
-          #                                #endif
-          #                              Defining the macro ourselves tells
-          #                              libedit the truth about bionic.
+          # libedit-20240808-3.1 has 2 hard incompatibilities with bionic:
+          #
+          # 1. src/readline.c lines ~1895-1910 use setpwent()/getpwent()/
+          #    endpwent() from <pwd.h> to do user-name completion (~ prefix).
+          #    Bionic does NOT implement these functions at all (Android
+          #    has no concept of a system password database). The code is
+          #    guarded by `#ifdef HAVE_GETPWENT`, but libedit's configure
+          #    on a real Linux system detects them and defines the macro,
+          #    then we cross-compile and the macros are cached → build fails.
+          #    Fix: patch src/readline.c to force-disable the block.
+          #
+          # 2. src/vis.c uses `NBBY` (Number of Bits per BYte = 8), a BSD
+          #    macro. glibc defines it in <sys/param.h>, bionic does not.
+          #    Fix: pass -DNBBY=8 via CFLAGS.
+          #
+          # 3. src/chartype.h checks __STDC_ISO_10646__ (bionic doesn't
+          #    define it even though wchar_t IS UTF-32). Fix: pass
+          #    -D__STDC_ISO_10646__=201103L via CFLAGS.
+          #
+          # 4. AC_CHECK_HEADERS needs termcap.h/ncurses.h/curses.h, and
+          #    AC_SEARCH_LIBS needs tgetent in libtermcap/libncurses/
+          #    libcurses/libtinfo. Fix: tiny stub (built in previous step)
+          #    provides both.
+
+          # Patch 1: nuke the getpwent user-name completion block in readline.c
+          # We do a conservative sed: comment out the 3 calls and the loop.
+          # This is a pure stub-out — psql's "~user" completion just won't
+          # work on Android, which is fine.
+          sed -i \
+            -e 's|^\([[:space:]]*\)setpwent();|/* \1setpwent(); -- disabled for Android */|' \
+            -e 's|^\([[:space:]]*\)endpwent();|/* \1endpwent(); -- disabled for Android */|' \
+            src/readline.c
+
+          # Replace the getpwent() loop with a "no users found" fallback.
+          # The loop looks like:
+          #     setpwent();
+          #     while (...) {
+          #         if ((pass = getpwent()) != NULL) { ... }
+          #     }
+          #     endpwent();
+          # We make getpwent always return NULL by macro-defining it.
+          # This way the loop runs zero iterations and we don't touch
+          # the surrounding control flow.
+          sed -i '/#include "readline.h"/a \
+          #if defined(__ANDROID__)\
+          #define getpwent() ((struct passwd *)NULL)\
+          #define setpwent() ((void)0)\
+          #define endpwent() ((void)0)\
+          #endif' \
+            src/readline.c
+
+          # Sanity check the patches landed
+          grep -n "disabled for Android" src/readline.c | head -5
+          grep -n "__ANDROID__" src/readline.c | head -5
+
           CC="$CC" AR="$AR" RANLIB="$RANLIB" \
-            CFLAGS="-I/tmp/staging/include -D__STDC_ISO_10646__=201103L" \
-            CPPFLAGS="-I/tmp/staging/include -D__STDC_ISO_10646__=201103L" \
+            CFLAGS="-I/tmp/staging/include -D__STDC_ISO_10646__=201103L -DNBBY=8" \
+            CPPFLAGS="-I/tmp/staging/include -D__STDC_ISO_10646__=201103L -DNBBY=8" \
             LDFLAGS="-L/tmp/staging/lib" \
             ./configure \
               --host=aarch64-linux-android \
